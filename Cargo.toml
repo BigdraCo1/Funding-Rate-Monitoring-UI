@@ -1,0 +1,33 @@
+[package]
+name = "hype"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hyperliquid_rust_sdk = { git = "https://github.com/hyperliquid-dex/hyperliquid-rust-sdk", branch = "master" }
+tokio = { version = "1.47.1", features = ["full"] }
+anyhow = "1.0.99"
+futures = "0.3.31"
+serde_json = "1.0.145"
+serde = { version = "1.0.225", features = ["derive"] }
+itertools = "0.14.0"
+ratatui = "0.29.0"
+crossterm = "0.29.0"
+color-eyre = "0.6.5"
+style = "0.1.0"
+ws = "0.9.2"
+log = "0.4.28"
+env_logger = "0.11.8"
+chrono = "0.4.42"
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+native-tls = "0.2"
+reqwest = "0.12.24"
+const_format = "0.2.35"
+
+# Add to Cargo.toml
+[profile.release]
+opt-level = 3
+lto = "fat"           # Link-time optimization
+codegen-units = 1     # Better optimization, slower compile
+panic = "abort"       # Smaller binary, slightly faster
+strip = true          # Remove symbols
