@@ -71,6 +71,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .sort_by(|a, b| a.market_id.cmp(&b.market_id));
     parse_json.funding_rates.dedup_by_key(|c| c.market_id);
     println!("info : {:?}", parse_json.funding_rates);
+    let mut market_map: HashMap<u8, String> = HashMap::new();
+    for market in parse_json.funding_rates {
+        market_map.insert(market.market_id, market.symbol);
+    }
     let url = "wss://mainnet.zklighter.elliot.ai/stream";
 
     // Connect to WebSocket with TLS
@@ -103,7 +107,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(message) = read.next().await {
         match message {
             Ok(Message::Text(text)) => match serde_json::from_str::<MarketStatsMessage>(&text) {
-                Ok(parsed) => println!("✅ Parsed struct:\n{:#?}", parsed.market_stats),
+                Ok(parsed) => {
+                    for (key, stats) in &parsed.market_stats {
+                        let symbol = market_map
+                            .get(&(stats.market_id as u8))
+                            .cloned()
+                            .unwrap_or_else(|| "Unknown".to_string());
+                        println!(
+                            "Market: {} | Symbol: {} | Current Funding Rate: {} | Funding Rate: {} | oi: {}",
+                            key,
+                            symbol,
+                            stats.current_funding_rate,
+                            stats.funding_rate,
+                            stats.open_interest_limit
+                        );
+                    }
+                }
                 Err(e) => eprintln!("❌ Failed to parse JSON: {e}"),
             },
             Ok(Message::Binary(bin)) => {

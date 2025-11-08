@@ -4,12 +4,14 @@ use ratatui::{
     DefaultTerminal, Frame,
     layout::{Alignment, Constraint, Flex, Layout, Margin, Rect},
     style::{Modifier, Style, Stylize},
-    text::Text,
     widgets::{
         Block, BorderType, Cell, Clear, HighlightSpacing, Paragraph, Row, Scrollbar,
         ScrollbarOrientation, ScrollbarState, Table, TableState,
     },
 };
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -17,6 +19,21 @@ use tokio::time::Instant;
 use crate::config::{ERROR_POPUP_DURATION_MS, INFO_TEXT, ITEM_HEIGHT, PALETTES, POLL_DURATION_MS};
 use crate::data::CoinData;
 use crate::ui::TableColors;
+
+fn log_debug(msg: String) {
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/hype_debug.log")
+    {
+        let _ = writeln!(
+            file,
+            "[{}] UI: {}",
+            chrono::Local::now().format("%H:%M:%S"),
+            msg
+        );
+    }
+}
 
 enum FundingRateRound {
     Hourly,
@@ -37,17 +54,33 @@ pub struct TuiApp {
     symbol: bool,
     popup: bool,
     popup_message: String,
-    exchange: u8,
+    exchange: Arc<Mutex<u8>>,
+    exchange_tx: mpsc::UnboundedSender<u8>,
+    all_coins: Vec<String>,
+    visible_coins: Vec<String>,
+    coin_list_rx: mpsc::UnboundedReceiver<Vec<String>>,
     error_popup_timer: Option<tokio::time::Instant>,
 }
 
 impl TuiApp {
-    pub fn new(coins: Vec<String>) -> Self {
-        let items = coins.into_iter().map(CoinData::new).collect::<Vec<_>>();
+    pub fn new(
+        coins: Vec<String>,
+        exchange: Arc<Mutex<u8>>,
+        exchange_tx: mpsc::UnboundedSender<u8>,
+        all_coins: Vec<String>,
+        coin_list_rx: mpsc::UnboundedReceiver<Vec<String>>,
+    ) -> Self {
+        let visible_coins = coins.clone();
+        let items = all_coins
+            .iter()
+            .map(|c| CoinData::new(c.clone()))
+            .collect::<Vec<_>>();
 
         Self {
             state: TableState::default().with_selected(0),
-            scroll_state: ScrollbarState::new((items.len().saturating_sub(1)) * ITEM_HEIGHT),
+            scroll_state: ScrollbarState::new(
+                (visible_coins.len().saturating_sub(1)) * ITEM_HEIGHT,
+            ),
             colors: TableColors::new(&PALETTES[0]),
             round: FundingRateRound::Hourly,
             color_index: 0,
@@ -55,24 +88,92 @@ impl TuiApp {
             symbol: false,
             popup: false,
             popup_message: String::new(),
-            exchange: 1,
+            exchange,
+            exchange_tx,
+            all_coins,
+            visible_coins,
+            coin_list_rx,
             error_popup_timer: None,
         }
     }
 
-    fn update_coin(&mut self, coin: &str, funding: f64, open_interest: f64, oracle_price: f64) {
+    fn get_visible_coins(&self, _exchange: u8) -> Vec<String> {
+        // Return all coins since filtering is now done by fetching different lists
+        self.all_coins.clone()
+    }
+
+    fn update_coin_list(&mut self, new_coins: Vec<String>) {
+        // Update all_coins with the new list
+        self.all_coins = new_coins.clone();
+        // Update visible_coins
+        self.visible_coins = new_coins.clone();
+        // Update items list - add new coins, keep existing data
+        let mut new_items = Vec::new();
+        for coin in new_coins.iter() {
+            if let Some(existing) = self.items.iter().find(|c| &c.coin == coin) {
+                new_items.push(existing.clone());
+            } else {
+                new_items.push(CoinData::new(coin.clone()));
+            }
+        }
+        self.items = new_items;
+        // Reset selection and scrollbar
+        self.state.select(Some(0));
+        self.update_scrollbar_size();
+    }
+
+    fn update_coin(
+        &mut self,
+        coin: &str,
+        funding: f64,
+        open_interest: f64,
+        oracle_price: f64,
+        exchange: u8,
+    ) {
+        // Filter updates based on visible coins
+        if !self.visible_coins.contains(&coin.to_string()) {
+            return;
+        }
+
         if let Some(c) = self.items.iter_mut().find(|c| c.coin == coin) {
-            c.update(funding, open_interest, oracle_price);
+            c.update_with_exchange(funding, open_interest, oracle_price, exchange);
             self.update_scrollbar_size();
         }
     }
 
     pub fn get_exchange(&self) -> u8 {
-        self.exchange
+        *self.exchange.lock().unwrap()
+    }
+
+    fn next_exchange(&mut self) {
+        let current = self.get_exchange();
+        log_debug(format!("next_exchange called, current={}", current));
+        let next = if current == 1 { 2 } else { 1 };
+        log_debug(format!("next_exchange: {} -> {}", current, next));
+        self.update_exchange(next);
     }
 
     fn update_exchange(&mut self, exchange: u8) {
-        self.exchange = exchange;
+        log_debug(format!("update_exchange called with exchange={}", exchange));
+        *self.exchange.lock().unwrap() = exchange;
+        log_debug(format!("Exchange lock updated to {}", exchange));
+        // Update visible coins based on new exchange
+        self.visible_coins = self.get_visible_coins(exchange);
+        log_debug(format!(
+            "Visible coins updated: {} coins",
+            self.visible_coins.len()
+        ));
+        // Notify the websocket manager about the change
+        log_debug(format!(
+            "Sending exchange {} to websocket manager",
+            exchange
+        ));
+        let _ = self.exchange_tx.send(exchange);
+        log_debug("Exchange sent to channel".to_string());
+        // Reset selection to first visible item
+        self.state.select(Some(0));
+        // Update scrollbar size for the filtered items
+        self.update_scrollbar_size();
     }
 
     fn next_row(&mut self) {
@@ -171,7 +272,11 @@ impl TuiApp {
     }
 
     fn update_scrollbar_size(&mut self) {
-        let items_with_data = self.items.iter().filter(|c| c.has_data()).count();
+        let items_with_data = self
+            .items
+            .iter()
+            .filter(|c| c.has_data() && self.visible_coins.contains(&c.coin))
+            .count();
         self.scroll_state = self
             .scroll_state
             .content_length((items_with_data.saturating_sub(1)) * ITEM_HEIGHT);
@@ -188,12 +293,17 @@ impl TuiApp {
     pub fn run(
         mut self,
         mut terminal: DefaultTerminal,
-        mut rx: mpsc::UnboundedReceiver<(String, f64, f64, f64)>,
+        mut rx: mpsc::UnboundedReceiver<(String, f64, f64, f64, u8)>,
     ) -> Result<()> {
         loop {
+            // Check for coin list updates
+            while let Ok(new_coins) = self.coin_list_rx.try_recv() {
+                self.update_coin_list(new_coins);
+            }
+
             // Drain updates
-            while let Ok((coin, funding, oi, price)) = rx.try_recv() {
-                self.update_coin(&coin, funding, oi, price);
+            while let Ok((coin, funding, oi, price, exchange)) = rx.try_recv() {
+                self.update_coin(&coin, funding, oi, price, exchange);
             }
 
             terminal.draw(|frame| self.draw(frame))?;
@@ -219,9 +329,7 @@ impl TuiApp {
                                     KeyCode::Char('h') | KeyCode::Left => self.previous_column(),
                                     KeyCode::Char('r') => self.next_round(),
                                     KeyCode::Char('t') => self.toggle_symbol(),
-                                    KeyCode::Char('s') => {
-                                        self.update_exchange(0u8);
-                                    }
+                                    KeyCode::Char('s') => self.next_exchange(),
                                     KeyCode::Enter => self.sort_collumn(),
                                     KeyCode::Char('/') => {
                                         // clear popup message
@@ -337,17 +445,22 @@ impl TuiApp {
             FundingRateRound::Annually => "Funding Rate (Annually)",
         };
 
-        let header: Row<'_> = ["Coin", header_funding_rate_display, "Open Interest"]
-            .into_iter()
-            .map(Cell::from)
-            .collect::<Row>()
-            .style(header_style);
+        let header: Row<'_> = [
+            "Coin",
+            header_funding_rate_display,
+            "Open Interest",
+            "Exchange",
+        ]
+        .into_iter()
+        .map(Cell::from)
+        .collect::<Row>()
+        .style(header_style);
 
         let rows = self
             .items
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.has_data())
+            .filter(|(_, c)| c.has_data() && self.visible_coins.contains(&c.coin))
             .map(|(i, c)| {
                 let bg = if i % 2 == 0 {
                     self.colors.normal_row_color
@@ -358,7 +471,7 @@ impl TuiApp {
                 let funding_color = self.colors.funding_rate_color(c.funding);
 
                 let mut funding_display = c.funding;
-                let mut open_interest_display: String;
+                let open_interest_display: String;
 
                 match self.round {
                     FundingRateRound::Hourly => {}
@@ -394,11 +507,26 @@ impl TuiApp {
                     open_interest_display = format!("{} {}", c.open_interest, c.coin);
                 }
 
+                let (exchange_display, exchange_color) = match c.current_exchange {
+                    1 => ("HL", ratatui::style::Color::Green),
+                    2 => ("LT", ratatui::style::Color::Yellow),
+                    3 => ("BOTH", ratatui::style::Color::Cyan),
+                    _ => ("?", ratatui::style::Color::Gray),
+                };
+
                 Row::new(vec![
                     Cell::from(c.coin.clone()),
-                    Cell::from(format!("{:.6}%", funding_display * 100.0))
-                        .style(Style::new().fg(funding_color)),
+                    Cell::from(format!(
+                        "{:.6}%",
+                        if c.current_exchange & 1 == 1 {
+                            funding_display * 100.0
+                        } else {
+                            funding_display
+                        }
+                    ))
+                    .style(Style::new().fg(funding_color)),
                     Cell::from(open_interest_display),
+                    Cell::from(exchange_display).style(Style::new().fg(exchange_color)),
                 ])
                 .style(Style::new().fg(self.colors.row_fg).bg(bg))
             });
@@ -409,6 +537,7 @@ impl TuiApp {
                 Constraint::Fill(1),
                 Constraint::Fill(1),
                 Constraint::Fill(1),
+                Constraint::Length(8),
             ],
         )
         .header(header)

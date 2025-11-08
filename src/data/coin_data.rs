@@ -4,6 +4,7 @@ pub struct CoinData {
     pub funding: f64,
     pub open_interest: f64,
     pub oracle_price: f64,
+    pub current_exchange: u8,
 }
 
 impl CoinData {
@@ -13,6 +14,7 @@ impl CoinData {
             funding: 0.0,
             open_interest: 0.0,
             oracle_price: 0.0,
+            current_exchange: 0,
         }
     }
 
@@ -22,7 +24,32 @@ impl CoinData {
         self.oracle_price = oracle_price;
     }
 
+    pub fn update_with_exchange(
+        &mut self,
+        funding: f64,
+        open_interest: f64,
+        oracle_price: f64,
+        exchange: u8,
+    ) {
+        self.funding = funding;
+        self.open_interest = open_interest;
+        self.oracle_price = oracle_price;
+        self.current_exchange = exchange;
+    }
+
     pub fn has_data(&self) -> bool {
         self.open_interest != 0.0
+    }
+
+    pub fn is_from_hyperliquid(&self) -> bool {
+        self.current_exchange & 1 != 0
+    }
+
+    pub fn is_from_lighter(&self) -> bool {
+        self.current_exchange & 2 != 0
+    }
+
+    pub fn is_from_both(&self) -> bool {
+        self.current_exchange == 3
     }
 }
